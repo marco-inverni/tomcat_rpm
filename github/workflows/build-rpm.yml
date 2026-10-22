@@ -1,0 +1,184 @@
+name: Build verified Tomcat RPM (Oracle Linux 10)
+
+on:
+  push:
+    paths:
+      - 'release/tomcat-release.json'
+      - 'packaging/**'
+      - '.github/workflows/build-rpm.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tomcat-rpm-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    # Only approved, default-branch releases. No PR code in privileged jobs.
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-24.04
+    container:
+      image: oraclelinux:10
+    timeout-minutes: 35
+    steps:
+      - name: Checkout approved sources
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Install minimal OL10 RPM build tools (no Java)
+        shell: bash
+        run: |
+          set -euo pipefail
+          dnf -y --setopt=install_weak_deps=False install \
+            rpm-build rpm curl gnupg2 jq tar gzip coreutils findutils ca-certificates
+
+      - name: Validate approved manifest, download Tomcat and verify signature
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LC_ALL=C
+          manifest=release/tomcat-release.json
+          [[ -s "$manifest" ]] || { echo 'Missing approved manifest: merge the Macro Task 1 proposal first.' >&2; exit 1; }
+          series="$(jq -er '.tomcat_series | select(type == "string")' "$manifest")"
+          version="$(jq -er '.tomcat_version | select(type == "string")' "$manifest")"
+          source="$(jq -er '.source | select(type == "string")' "$manifest")"
+          approved_sha="$(jq -er '.sha512 | select(type == "string")' "$manifest")"
+          [[ "$series" =~ ^9\.(0|[1-9][0-9]*)$ ]] || { echo 'Invalid Tomcat 9 series' >&2; exit 1; }
+          [[ "$version" =~ ^9\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ && "$version" == "${series}."* ]] || {
+            echo 'Invalid version or series mismatch' >&2; exit 1;
+          }
+          [[ "$approved_sha" =~ ^[0-9a-f]{128}$ ]] || { echo 'Invalid approved SHA-512' >&2; exit 1; }
+          case "$source" in
+            apache-downloads) root='https://downloads.apache.org/tomcat' ;;
+            apache-archive) root='https://archive.apache.org/dist/tomcat' ;;
+            *) echo 'Unapproved Apache source identifier' >&2; exit 1 ;;
+          esac
+          filename="apache-tomcat-${version}.tar.gz"
+          url="${root}/tomcat-9/v${version}/bin/${filename}"
+          # Do not obey URLs from the manifest; recompute from validated values.
+          jq -e --arg url "$url" --arg series "$series" --arg version "$version" --arg source "$source" \
+            '(.schema_version == 1) and (.download_url == $url) and
+             (.sha512_url == ($url + ".sha512")) and
+             (.signature_url == ($url + ".asc")) and
+             (.tomcat_series == $series) and (.tomcat_version == $version) and
+             (.source == $source)' "$manifest" > /dev/null || {
+            echo 'Approved manifest does not match canonical upstream addresses' >&2; exit 1;
+          }
+
+          mkdir -p upstream rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS,BUILDROOT} dist
+          cd upstream
+          fetch() {
+            curl --fail --silent --show-error --retry 3 --connect-timeout 10 \
+              --max-time 240 --proto '=https' --max-redirs 0 -o "$2" "$1"
+            test -s "$2"
+          }
+          fetch "$url" "$filename"
+          fetch "${url}.sha512" "${filename}.sha512"
+          fetch "${url}.asc" "${filename}.asc"
+          # Independently fetch the Apache upstream public-key collection.
+          fetch 'https://downloads.apache.org/tomcat/tomcat-9/KEYS' 'apache-KEYS'
+
+          # Compare the freshly fetched Apache digest with the approved manifest.
+          upstream_sha="$(awk -v file="$filename" '
+            NF==2 && ($2==file || $2==( "*" file )) &&
+            length($1)==128 && $1~/^[[:xdigit:]]+$/ {print tolower($1); n++}
+            END {if (n!=1) exit 1}
+          ' "${filename}.sha512")" || { echo 'Invalid Apache checksum file' >&2; exit 1; }
+          [[ "$upstream_sha" == "$approved_sha" ]] || { echo 'Approved upstream digest differs from Apache current digest' >&2; exit 1; }
+          printf '%s  %s\n' "$approved_sha" "$filename" | sha512sum --check --strict -
+
+          # Fixed independently reviewed Apache Tomcat signing-key fingerprints.
+          # Mark Thomas (2009 key), Remy Maucherat (2019 key).
+          # Rotate only through a reviewed repository change, NEVER from upstream KEYS alone.
+          trusted_signers=(
+            A9C5DF4D22E99998D9875A5110C01C5A2F6059E7
+            48F8E69F6390C9F25CFEDCD268248959359E722B
+          )
+          export GNUPGHOME="$PWD/gpg-all"
+          mkdir -m 0700 "$GNUPGHOME"
+          gpg --batch --import apache-KEYS
+          # Export only the pinned keys into a NEW, isolated keyring.
+          : > trusted-KEYS.asc
+          for fingerprint in "${trusted_signers[@]}"; do
+            gpg --batch --export --armor "$fingerprint" >> trusted-KEYS.asc
+          done
+          [[ -s trusted-KEYS.asc ]] || { echo 'No trusted Tomcat keys found in Apache KEYS' >&2; exit 1; }
+          export GNUPGHOME="$PWD/gpg-trusted"
+          mkdir -m 0700 "$GNUPGHOME"
+          gpg --batch --import trusted-KEYS.asc
+          # A positive SHA-512 comparison alone is not authentication.
+          gpg --batch --status-fd 1 --verify "${filename}.asc" "$filename" > signature-status.txt
+          grep -q '^\[GNUPG:\] VALIDSIG ' signature-status.txt || {
+            echo 'No valid OpenPGP signature by an allowlisted Tomcat signer' >&2; exit 1;
+          }
+          grep '^\[GNUPG:\] VALIDSIG ' signature-status.txt
+          rm -rf -- gpg-all gpg-trusted
+
+          # Basic structural guard before RPM's %prep unpacks it.
+          tar -tzf "$filename" > archive-members.txt
+          grep -Fxq "apache-tomcat-${version}/bin/catalina.sh" archive-members.txt
+          grep -Fxq "apache-tomcat-${version}/lib/catalina.jar" archive-members.txt
+          cd ..
+          cp "upstream/${filename}" "rpmbuild/SOURCES/${filename}"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "verified_sha512=$approved_sha" >> "$GITHUB_OUTPUT"
+          {
+            echo '### Verified Apache Tomcat upstream archive'
+            printf -- '- Version: `%s`\n' "$version"
+            printf -- '- SHA-512: `%s`\n' "$approved_sha"
+            echo '- OpenPGP: verified with a reviewed, allowlisted Apache Tomcat signer'
+            echo '- Java download: none'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build and inspect Oracle Linux 10 RPM
+        shell: bash
+        env:
+          VERIFIED_TOMCAT_VERSION: ${{ steps.upstream.outputs.version }}
+        run: |
+          set -euo pipefail
+          version="$VERIFIED_TOMCAT_VERSION"
+          rpmbuild -bb \
+            --define "_topdir ${GITHUB_WORKSPACE}/rpmbuild" \
+            --define "tomcat_version $version" \
+            --define 'dist .el10' \
+            packaging/apache-tomcat9-custom.spec
+          shopt -s nullglob
+          rpms=(rpmbuild/RPMS/noarch/apache-tomcat9-custom-*.el10.noarch.rpm)
+          [[ "${#rpms[@]}" -eq 1 ]] || { echo 'Expected exactly one OL10 noarch RPM' >&2; exit 1; }
+          rpm_file="${rpms[0]}"
+          [[ "$(rpm -qp --qf '%{VERSION}' "$rpm_file")" == "$version" ]] || exit 1
+          [[ "$(rpm -qp --qf '%{ARCH}' "$rpm_file")" == noarch ]] || exit 1
+          # No Java, JRE or JDK dependency may be pulled in by DNF.
+          if rpm -qp --requires "$rpm_file" | grep -Ei '(^|[^[:alpha:]])(java|jre|jdk|openjdk)([^[:alpha:]]|$)'; then
+            echo 'Unexpected Java dependency' >&2; exit 1
+          fi
+          rpm -qpl "$rpm_file" > dist/package-files.txt
+          grep -q '^/usr/share/apache-tomcat9-custom/bin/catalina.sh$' dist/package-files.txt
+          grep -q '^/usr/share/apache-tomcat9-custom/lib/catalina.jar$' dist/package-files.txt
+          grep -q '^/usr/share/apache-tomcat9-custom/conf/server.xml$' dist/package-files.txt
+          if grep -E '^(/tomcat/|/usr/share/apache-tomcat9-custom/(webapps|work|temp|logs)(/|$))' dist/package-files.txt; then
+            echo 'Runtime/application directories must not be included' >&2; exit 1
+          fi
+          # Installation must work without any Java installed on OL10.
+          rpm -Uvh "$rpm_file"
+          rpm -V apache-tomcat9-custom
+          test -f /usr/share/apache-tomcat9-custom/bin/bootstrap.jar
+          test ! -e /usr/share/apache-tomcat9-custom/webapps
+          test ! -e /tomcat
+          cp "$rpm_file" dist/
+          (cd dist && sha256sum *.rpm > SHA256SUMS)
+          printf 'Macro Task 2: unsigned build artifact; DO NOT publish to DNF as signed.\n' > dist/STATUS.txt
+          cat dist/SHA256SUMS
+
+      - name: Upload unsigned, verified-origin RPM artifact (not a DNF repo)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: tomcat9-ol10-rpm-${{ steps.upstream.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
